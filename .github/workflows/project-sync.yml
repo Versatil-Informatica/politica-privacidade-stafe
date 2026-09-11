@@ -181,14 +181,17 @@ jobs:
                               $repo: String!,
                               $number: Int!
                           ) {
-                              repository(
-                                  owner: $owner,
-                                  name: $repo
-                              ) {
+                              repository(owner: $owner, name: $repo) {
                                   issue(number: $number) {
                                       id
                                       state
                                       url
+                                      assignees(first: 10) {
+                                          totalCount
+                                          nodes {
+                                              login
+                                          }
+                                      }
                                       projectItems(first: 100) {
                                           nodes {
                                               id
@@ -205,17 +208,9 @@ jobs:
                           -F number="$issue_number"
                   )"
 
-                  issue_id="$(
-                      jq -r \
-                          '.data.repository.issue.id // empty' \
-                          <<< "$issue_json"
-                  )"
-
-                  issue_state="$(
-                      jq -r \
-                          '.data.repository.issue.state // empty' \
-                          <<< "$issue_json"
-                  )"
+                  issue_id="$(jq -r '.data.repository.issue.id // empty' <<< "$issue_json")"
+                  issue_state="$(jq -r '.data.repository.issue.state // empty' <<< "$issue_json")"
+                  assignee_count="$(jq -r '.data.repository.issue.assignees.totalCount // 0' <<< "$issue_json")"
 
                   if [[ -z "$issue_id" ]]; then
                       echo "Issue #$issue_number não encontrada."
@@ -239,6 +234,33 @@ jobs:
 
                   echo "issue_id=$issue_id" >> "$GITHUB_OUTPUT"
                   echo "item_id=$item_id" >> "$GITHUB_OUTPUT"
+                  echo "assignee_count=$assignee_count" >> "$GITHUB_OUTPUT"
+
+            - name: Definir responsável ao iniciar trabalho
+              if: github.event_name == 'create' && steps.issue.outputs.issue_id != '' && steps.issue.outputs.assignee_count == '0'
+              shell: bash
+              env:
+                  REPOSITORY_OWNER: ${{ github.repository_owner }}
+                  REPOSITORY_NAME: ${{ github.event.repository.name }}
+                  BRANCH_ACTOR: ${{ github.actor }}
+              run: |
+                  set -euo pipefail
+
+                  issue_number="${{ steps.target.outputs.issue_number }}"
+                  actor="$BRANCH_ACTOR"
+
+                  if [[ "$actor" == *"[bot]" ]]; then
+                      echo "Branch criada por '$actor'; responsável automático ignorado."
+                      exit 0
+                  fi
+
+                  gh api \
+                      --method POST \
+                      "repos/$REPOSITORY_OWNER/$REPOSITORY_NAME/issues/$issue_number/assignees" \
+                      -f "assignees[]=$actor" \
+                      --silent
+
+                  echo "Issue #$issue_number atribuída automaticamente a @$actor."
 
             - name: Adicionar Issue ao Project
               id: add_item
@@ -249,19 +271,9 @@ jobs:
 
                   item_id="$(
                       gh api graphql \
-                          -f query='mutation(
-                              $project: ID!,
-                              $content: ID!
-                          ) {
-                              addProjectV2ItemById(
-                                  input: {
-                                      projectId: $project,
-                                      contentId: $content
-                                  }
-                              ) {
-                                  item {
-                                      id
-                                  }
+                          -f query='mutation($project: ID!, $content: ID!) {
+                              addProjectV2ItemById(input: { projectId: $project, contentId: $content }) {
+                                  item { id }
                               }
                           }' \
                           -f project="${{ steps.project.outputs.project_id }}" \
@@ -283,7 +295,6 @@ jobs:
                   set -euo pipefail
 
                   item_id="${{ steps.issue.outputs.item_id }}"
-
                   if [[ -z "$item_id" ]]; then
                       item_id="${{ steps.add_item.outputs.item_id }}"
                   fi
@@ -294,25 +305,14 @@ jobs:
                   fi
 
                   gh api graphql \
-                      -f query='mutation(
-                          $project: ID!,
-                          $item: ID!,
-                          $field: ID!,
-                          $option: String!
-                      ) {
-                          updateProjectV2ItemFieldValue(
-                              input: {
-                                  projectId: $project,
-                                  itemId: $item,
-                                  fieldId: $field,
-                                  value: {
-                                      singleSelectOptionId: $option
-                                  }
-                              }
-                          ) {
-                              projectV2Item {
-                                  id
-                              }
+                      -f query='mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                          updateProjectV2ItemFieldValue(input: {
+                              projectId: $project,
+                              itemId: $item,
+                              fieldId: $field,
+                              value: { singleSelectOptionId: $option }
+                          }) {
+                              projectV2Item { id }
                           }
                       }' \
                       -f project="${{ steps.project.outputs.project_id }}" \
