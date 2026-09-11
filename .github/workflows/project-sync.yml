@@ -1,0 +1,324 @@
+name: Sincronizar Issue com Project Santa Fé
+
+on:
+    issues:
+        types:
+            - opened
+            - reopened
+            - closed
+    create:
+
+permissions:
+    contents: read
+    issues: read
+
+jobs:
+    sync-project:
+        if: github.event_name == 'issues' || (github.event_name == 'create' && github.event.ref_type == 'branch')
+        runs-on: ubuntu-latest
+
+        env:
+            GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+            ORGANIZATION: Versatil-Informatica
+            PROJECT_TITLE: Santa Fé - Desenvolvimento
+            STATUS_FIELD_NAME: Status
+            STATUS_TODO: A fazer
+            STATUS_IN_PROGRESS: Em andamento
+            STATUS_DONE: Concluído
+
+        steps:
+            - name: Determinar Issue e status
+              id: target
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  if [[ "${{ github.event_name }}" == "issues" ]]; then
+                      issue_number="${{ github.event.issue.number }}"
+
+                      case "${{ github.event.action }}" in
+                          opened|reopened)
+                              desired_status="$STATUS_TODO"
+                              ;;
+                          closed)
+                              desired_status="$STATUS_DONE"
+                              ;;
+                          *)
+                              exit 0
+                              ;;
+                      esac
+                  else
+                      branch="${{ github.event.ref }}"
+
+                      if [[ "$branch" =~ ^(feat|fix|chore|refactor|docs|test|perf|build|ci|hotfix)/([0-9]+)([-/].*)?$ ]]; then
+                          issue_number="${BASH_REMATCH[2]}"
+                          desired_status="$STATUS_IN_PROGRESS"
+                      else
+                          echo "Branch '$branch' não segue o padrão com número da Issue."
+                          exit 0
+                      fi
+                  fi
+
+                  echo "issue_number=$issue_number" >> "$GITHUB_OUTPUT"
+                  echo "desired_status=$desired_status" >> "$GITHUB_OUTPUT"
+
+            - name: Localizar Project
+              id: project
+              if: steps.target.outputs.issue_number != ''
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  projects_json="$(
+                      gh api graphql \
+                          -f query='query($org: String!) {
+                              organization(login: $org) {
+                                  projectsV2(first: 100) {
+                                      nodes {
+                                          id
+                                          title
+                                      }
+                                  }
+                              }
+                          }' \
+                          -f org="$ORGANIZATION"
+                  )"
+
+                  project_id="$(
+                      jq -r \
+                          --arg title "$PROJECT_TITLE" \
+                          '.data.organization.projectsV2.nodes[]
+                          | select(.title == $title)
+                          | .id' \
+                          <<< "$projects_json" |
+                      head -n 1
+                  )"
+
+                  if [[ -z "$project_id" ]]; then
+                      echo "Project '$PROJECT_TITLE' não encontrado."
+                      exit 1
+                  fi
+
+                  fields_json="$(
+                      gh api graphql \
+                          -f query='query($id: ID!) {
+                              node(id: $id) {
+                                  ... on ProjectV2 {
+                                      fields(first: 100) {
+                                          nodes {
+                                              ... on ProjectV2SingleSelectField {
+                                                  id
+                                                  name
+                                                  options {
+                                                      id
+                                                      name
+                                                  }
+                                              }
+                                          }
+                                      }
+                                  }
+                              }
+                          }' \
+                          -f id="$project_id"
+                  )"
+
+                  status_field_id="$(
+                      jq -r \
+                          --arg field "$STATUS_FIELD_NAME" \
+                          '.data.node.fields.nodes[]
+                          | select(.name == $field)
+                          | .id' \
+                          <<< "$fields_json" |
+                      head -n 1
+                  )"
+
+                  desired_status="${{ steps.target.outputs.desired_status }}"
+
+                  option_id="$(
+                      jq -r \
+                          --arg field "$STATUS_FIELD_NAME" \
+                          --arg status "$desired_status" \
+                          '.data.node.fields.nodes[]
+                          | select(.name == $field)
+                          | .options[]
+                          | select(.name == $status)
+                          | .id' \
+                          <<< "$fields_json" |
+                      head -n 1
+                  )"
+
+                  if [[ -z "$status_field_id" ]]; then
+                      echo "Campo Status não encontrado."
+                      exit 1
+                  fi
+
+                  if [[ -z "$option_id" ]]; then
+                      echo "Opção '$desired_status' não encontrada."
+                      exit 1
+                  fi
+
+                  echo "project_id=$project_id" >> "$GITHUB_OUTPUT"
+                  echo "status_field_id=$status_field_id" >> "$GITHUB_OUTPUT"
+                  echo "option_id=$option_id" >> "$GITHUB_OUTPUT"
+
+            - name: Localizar Issue
+              id: issue
+              if: steps.project.outputs.project_id != ''
+              shell: bash
+              env:
+                  REPOSITORY_OWNER: ${{ github.repository_owner }}
+                  REPOSITORY_NAME: ${{ github.event.repository.name }}
+              run: |
+                  set -euo pipefail
+
+                  issue_number="${{ steps.target.outputs.issue_number }}"
+                  project_id="${{ steps.project.outputs.project_id }}"
+
+                  issue_json="$(
+                      gh api graphql \
+                          -f query='query(
+                              $owner: String!,
+                              $repo: String!,
+                              $number: Int!
+                          ) {
+                              repository(
+                                  owner: $owner,
+                                  name: $repo
+                              ) {
+                                  issue(number: $number) {
+                                      id
+                                      state
+                                      url
+                                      projectItems(first: 100) {
+                                          nodes {
+                                              id
+                                              project {
+                                                  id
+                                              }
+                                          }
+                                      }
+                                  }
+                              }
+                          }' \
+                          -f owner="$REPOSITORY_OWNER" \
+                          -f repo="$REPOSITORY_NAME" \
+                          -F number="$issue_number"
+                  )"
+
+                  issue_id="$(
+                      jq -r \
+                          '.data.repository.issue.id // empty' \
+                          <<< "$issue_json"
+                  )"
+
+                  issue_state="$(
+                      jq -r \
+                          '.data.repository.issue.state // empty' \
+                          <<< "$issue_json"
+                  )"
+
+                  if [[ -z "$issue_id" ]]; then
+                      echo "Issue #$issue_number não encontrada."
+                      exit 0
+                  fi
+
+                  if [[ "${{ github.event_name }}" == "create" && "$issue_state" != "OPEN" ]]; then
+                      echo "Issue #$issue_number está fechada."
+                      exit 0
+                  fi
+
+                  item_id="$(
+                      jq -r \
+                          --arg project_id "$project_id" \
+                          '.data.repository.issue.projectItems.nodes[]
+                          | select(.project.id == $project_id)
+                          | .id' \
+                          <<< "$issue_json" |
+                      head -n 1
+                  )"
+
+                  echo "issue_id=$issue_id" >> "$GITHUB_OUTPUT"
+                  echo "item_id=$item_id" >> "$GITHUB_OUTPUT"
+
+            - name: Adicionar Issue ao Project
+              id: add_item
+              if: steps.issue.outputs.issue_id != '' && steps.issue.outputs.item_id == ''
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  item_id="$(
+                      gh api graphql \
+                          -f query='mutation(
+                              $project: ID!,
+                              $content: ID!
+                          ) {
+                              addProjectV2ItemById(
+                                  input: {
+                                      projectId: $project,
+                                      contentId: $content
+                                  }
+                              ) {
+                                  item {
+                                      id
+                                  }
+                              }
+                          }' \
+                          -f project="${{ steps.project.outputs.project_id }}" \
+                          -f content="${{ steps.issue.outputs.issue_id }}" \
+                          --jq '.data.addProjectV2ItemById.item.id'
+                  )"
+
+                  if [[ -z "$item_id" || "$item_id" == "null" ]]; then
+                      echo "Não foi possível adicionar a Issue ao Project."
+                      exit 1
+                  fi
+
+                  echo "item_id=$item_id" >> "$GITHUB_OUTPUT"
+
+            - name: Atualizar status no Project
+              if: steps.issue.outputs.issue_id != ''
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  item_id="${{ steps.issue.outputs.item_id }}"
+
+                  if [[ -z "$item_id" ]]; then
+                      item_id="${{ steps.add_item.outputs.item_id }}"
+                  fi
+
+                  if [[ -z "$item_id" ]]; then
+                      echo "Item do Project não encontrado."
+                      exit 1
+                  fi
+
+                  gh api graphql \
+                      -f query='mutation(
+                          $project: ID!,
+                          $item: ID!,
+                          $field: ID!,
+                          $option: String!
+                      ) {
+                          updateProjectV2ItemFieldValue(
+                              input: {
+                                  projectId: $project,
+                                  itemId: $item,
+                                  fieldId: $field,
+                                  value: {
+                                      singleSelectOptionId: $option
+                                  }
+                              }
+                          ) {
+                              projectV2Item {
+                                  id
+                              }
+                          }
+                      }' \
+                      -f project="${{ steps.project.outputs.project_id }}" \
+                      -f item="$item_id" \
+                      -f field="${{ steps.project.outputs.status_field_id }}" \
+                      -f option="${{ steps.project.outputs.option_id }}" \
+                      --silent
+
+                  echo "Issue #${{ steps.target.outputs.issue_number }} → ${{ steps.target.outputs.desired_status }}"
